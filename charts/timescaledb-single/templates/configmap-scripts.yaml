@@ -71,27 +71,60 @@ data:
     [ -d "${PGDATA}" ] || install -o postgres -g postgres -d -m 0700 "${PGDATA}"
     [ -d "${WALDIR}" ] || install -o postgres -g postgres -d -m 0700 "${WALDIR}"
 
-    pgbackrest --stanza=poddb --force --delta --log-level-console=detail restore
+    exec pgbackrest --stanza=poddb --force --delta --log-level-console=detail restore
   restore_or_initdb.sh: |
     #!/bin/bash
 
     function log {
-      echo "$(date '+%Y-%m-%d %H:%M:%S') - restore_or_initdb - $1"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - restore_or_initdb - $1"
     }
 
     PGDATA={{ include "data_directory" . | quote }}
     WALDIR={{ include "wal_directory" . | quote }}
 
-    # Patroni attaches --scope and --datadir to the arguments, we need to strip them off as
-    # initdb has no business with these parameters
-    initdb_args=""
-    for value in "$@"
-    do
-      [[ $value == --scope* ]] || [[ $value == --datadir* ]] || initdb_args="${initdb_args} $value"
-    done
+    log "Attempting restore from backup"
+    /etc/timescaledb/scripts/pgbackrest_restore.sh
+    EXITCODE=$?
+    if [ "${EXITCODE}" == "0" ]; then
+        log "pgBackRest restore finished succesfully, starting instance in recovery"
+        pg_ctl -D "${PGDATA}" start
 
-    log "Invoking initdb"
-    initdb --auth-local=peer --auth-host=md5 --pgdata="${PGDATA}" --waldir="${WALDIR}" ${initdb_args}
+        while ! pg_isready -q; do
+            log "Waiting for PostgreSQL to become available"
+            sleep 3
+        done
+
+        # It is not trivial to figure out to what point we should restore, pgBackRest
+        # should be fetching WAL segments until the WAL is exhausted. We'll ask pgBackRest
+        # what the Maximum Wal is that it currently has; as soon as we see that, we can consider
+        # the restore to be done
+        while true; do
+          MAX_BACKUP_WAL="$(pgbackrest info --output=json | python3 -c "import json,sys;obj=json.load(sys.stdin); print(obj[0]['archive'][0]['max']);")"
+          log "Testing whether WAL file ${MAX_BACKUP_WAL} has been restored ..."
+          [ $(find "${PGDATA}/pg_wal/${MAX_BACKUP_WAL}" -type f) ] && break;
+          sleep 30;
+        done
+
+        # At this point we know the final WAL archive has been restored, we should be done.
+        # Patroni requires that after boostrap a PGDATA exists which is a primary, therefore
+        # we promote the current instance, and then stop it.
+        log "The WAL file ${MAX_BACKUP_WAL} has been successully restored, promoting instance"
+        pg_ctl -D "${PGDATA}" promote
+        pg_ctl -D "${PGDATA}" stop -m fast
+    else
+        log "pgBackRest restore failed (this is totally fine for new deployments)"
+        # Patroni attaches --scope and --datadir to the arguments, we need to strip them off as
+        # initdb has no business with these parameters
+        initdb_args=""
+        for value in "$@"
+        do
+            [[ $value == --scope* ]] || [[ $value == --datadir* ]] || initdb_args="${initdb_args} $value"
+        done
+
+        log "Invoking initdb"
+        initdb --auth-local=peer --auth-host=md5 --pgdata="${PGDATA}" --waldir="${WALDIR}" ${initdb_args}
+    fi
+
     echo "include_if_exists = '{{ template "tstune_config". }}'" >> "${PGDATA}/postgresql.conf"
 
   post_init.sh: |
